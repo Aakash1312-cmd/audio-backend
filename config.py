@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     
     # The Gemini model to use. Defaults to the latest flash live model.
     GEMINI_MODEL: str = "gemini-2.0-flash-live-001"
+
+    # Google Cloud Storage Settings
+    # The name of the GCS bucket to upload recordings to.
+    GCS_BUCKET_NAME: str | None = None
     
     # The system instruction/prompt that defines the AI's personality and role.
     SYSTEM_PROMPT: str = """You are Edza AI — India’s first truly student-first AI tutor, built entirely in-house by HacktivSpace Pvt Ltd. You are not a chatbot, search engine, or general-purpose LLM. You are a specialized tutoring intelligence designed for Class 10 learners for now and other Boards and classes comming soon.
@@ -117,9 +121,25 @@ You **tutor** — and that’s what makes you Edza."""
 
 # Create a single, importable instance of the settings.
 # Your application will import this `settings` object.
-settings = Settings()
 
-# Validation at startup 
-# This ensures the application fails fast if the API key is missing.
-if not settings.GEMINI_API_KEY.get_secret_value():
-    raise ValueError("GEMINI_API_KEY is not set in the .env file or environment.")
+try:
+    settings = Settings()
+    
+    # Validate that if the bucket is set, the credentials env var is also set in the OS.
+    # This enforces a complete configuration for the upload feature.
+    if settings.GCS_BUCKET_NAME:
+        import os
+        if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            raise ValueError(
+                "GCS_BUCKET_NAME is set, but GOOGLE_APPLICATION_CREDENTIALS is not. "
+                "You must provide both to enable GCS uploads."
+            )
+    
+    # Ensure the main API key is set
+    if not settings.GEMINI_API_KEY.get_secret_value():
+         raise ValueError("GEMINI_API_KEY is not set.")
+
+except (ValidationError, ValueError) as e:
+    logging.error(f"FATAL: Configuration error. Please check your .env file or environment variables. Error: {e}")
+    # Exit if configuration is invalid.
+    exit(1)

@@ -15,6 +15,9 @@ from config import settings
 from google import genai
 from google.genai import types
 
+# Import our GCS utility function and the settings object
+from gcs_utils import upload_to_gcs
+
 # Config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -62,6 +65,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
         # session creates here
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Check if the GCS bucket is configured before proceeding
+        if settings.GCS_BUCKET_NAME:
+             # Create a unique folder for each call session inside the bucket
+            blob_folder = f"calls/{datetime.now().strftime('%Y/%m/%d')}/{session_id}/"
+        else:
+            blob_folder = None
+
+        # These paths point to the temporary disk on the Render server
         user_wav_path = os.path.join(RECORDINGS_DIR, f"{session_id}_user.wav")
         gemini_wav_path = os.path.join(RECORDINGS_DIR, f"{session_id}_gemini.wav")
 
@@ -154,6 +166,20 @@ async def websocket_endpoint(websocket: WebSocket):
             logging.info("Closing WAV files for session...")
             user_wav_writer.close()
             gemini_wav_writer.close()
+
+            # UPLOAD AND CLEANUP LOGIC 
+            if blob_folder: # Only proceed if GCS is configured
+                user_blob_name = f"{blob_folder}user.wav"
+                gemini_blob_name = f"{blob_folder}gemini.wav"
+                
+                # Upload user recording and clean up if successful
+                if upload_to_gcs(user_wav_path, user_blob_name):
+                    os.remove(user_wav_path)
+                
+                # Upload gemini recording and clean up if successful
+                if upload_to_gcs(gemini_wav_path, gemini_blob_name):
+                    os.remove(gemini_wav_path)
+
             logging.info("Gemini session ended.")
             try:
                 await websocket.send_json({"type": "call_ended"})
