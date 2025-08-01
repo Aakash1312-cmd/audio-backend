@@ -1,0 +1,2 @@
+uvicorn app:app --host localhost --port 8000 --ssl-keyfile=certs/key.pem --ssl-certfile=certs/cert.pem
+streamlit run frontend/streamlit_app.py
