@@ -56,14 +56,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif "bytes" in message:
                      logging.warning("Received unexpected binary data while idle. Ignoring.")
                      continue
+                
             except WebSocketDisconnect:
-                logging.info("Client disconnected while idle.")
-                raise
+                logging.info(f"Client {websocket.client} disconnected during idle phase. Closing connection.")
+                return
             except (json.JSONDecodeError, KeyError):
-                logging.warning("Received invalid message format while idle. Ignoring.")
+                logging.warning(f"Received invalid message format {websocket.client} while idle. Ignoring.")
                 continue
+            except Exception as e:
+                logging.error(f"Error in idle loop for {websocket.client}: {e}",exc_info=True)
+                # You might want to close the connection here too.
+                return
+            
 
-        # session creates here
+        # new gemini session creates here
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Check if the GCS bucket is configured before proceeding
