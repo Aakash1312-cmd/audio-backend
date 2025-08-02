@@ -52,12 +52,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         break
                     else:
                         logging.warning("Received unexpected JSON message while idle: %s", message_json)
-                        continue
                 elif "bytes" in message:
                      logging.warning("Received unexpected binary data while idle. Ignoring.")
-                     continue
                 
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 logging.info(f"Client {websocket.client} disconnected during idle phase. Closing connection.")
                 return
             except (json.JSONDecodeError, KeyError):
