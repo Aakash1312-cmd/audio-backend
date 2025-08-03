@@ -115,17 +115,21 @@ async def websocket_endpoint(websocket: WebSocket):
                             if "bytes" in message:
                                 data = message["bytes"]
                                 user_wav_writer.writeframes(data)
-                                await session.send(input={"data": data, "mime_type": "audio/pcm;rate=16000"})
+                                # Before sending to Gemini, we must encode the raw bytes into a Base64 string.
+                                encoded_audio = base64.b64encode(data).decode('utf-8')
+                                await session.send(input={"data": encoded_audio, "mime_type": "audio/pcm;rate=16000"})
 
                             elif "text" in message:
                                 control_msg = json.loads(message["text"])
                                 msg_type = control_msg.get("type")
 
                                 if msg_type == "video_frame":
-                                    img_data = base64.b64decode(control_msg["payload"])
+                                    #  This is for VIDEO, which arrives as a Base64 string from BOTH the frontend and Locust
+                                    # We just need to forward the string directly. DO NOT decode it.
+                                    img_payload = control_msg["payload"] 
                                     logging.info("Sending a video frame to Gemini.")
                                     # sending live frames 
-                                    await session.send(input={"data": img_data, "mime_type": "image/jpeg"})
+                                    await session.send(input={"data": img_payload, "mime_type": "image/jpeg"})
 
                                 elif msg_type == "audio_stream_end":
                                     logging.info("Received audio_stream_end signal. Closing user input task.")
