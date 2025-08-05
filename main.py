@@ -8,6 +8,7 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import uuid
 
 
 from config import settings
@@ -19,7 +20,12 @@ from google.genai import types
 from gcs_utils import upload_to_gcs
 
 # Config
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+# A thread-safe set to store IDs of all active WebSocket connections
+ACTIVE_CONNECTIONS = set()
+# A thread-safe set to store IDs of only the sessions actively using the Gemini API
+ACTIVE_GEMINI_SESSIONS = set()
 
 MODEL = settings.GEMINI_MODEL
 RECORDINGS_DIR = settings.RECORDINGS_DIR
@@ -34,41 +40,56 @@ app.add_middleware(
 # Gemini Client
 client = genai.Client(api_key=settings.GEMINI_API_KEY.get_secret_value())
 
+@app.get("/status")
+async def get_status():
+    """An HTTP endpoint to get real-time stats about the service."""
+    return {
+        "active_connections": len(ACTIVE_CONNECTIONS),
+        "active_gemini_sessions": len(ACTIVE_GEMINI_SESSIONS)
+    }
+
 @app.websocket("/ws-ai")
 async def websocket_endpoint(websocket: WebSocket):
+
+    connection_id = str(uuid.uuid4())
+    ACTIVE_CONNECTIONS.add(connection_id)
+
+    # UPGRADE: Create a context dictionary that will be part of every log message
+    log_context = {"connection_id": connection_id, "client": str(websocket.client)}
+
     await websocket.accept()
-    logging.info("WebSocket connection accepted from: %s", websocket.client)
+    logging.info(json.dumps({**log_context, "event": "connection_accepted", "total_active_connections": len(ACTIVE_CONNECTIONS)}))
 
     try:
+        session_id = None
         while True:
             try:
-                # use receive() as it 
                 # This prevents a crash if binary data is received unexpectedly.
                 message = await websocket.receive()
                 if "text" in message:
                     message_json = json.loads(message["text"])
                     if message_json.get("type") == "start_call":
-                        logging.info("Received start_call signal. Initializing Gemini Live session.")
+                        session_id = f"call_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
+                        log_context["session_id"] = session_id # Add it to our logging context
+                        logging.info(json.dumps({**log_context, "event": "start_call_signal_received"}))
                         break
                     else:
-                        logging.warning("Received unexpected JSON message while idle: %s", message_json)
+                        logging.warning(json.dumps({**log_context, "event": "unexpected_idle_message", "message": message_json}))
                 elif "bytes" in message:
-                     logging.warning("Received unexpected binary data while idle. Ignoring.")
-                
-            except (WebSocketDisconnect, RuntimeError):
-                logging.info(f"Client {websocket.client} disconnected during idle phase. Closing connection.")
-                return
-            except (json.JSONDecodeError, KeyError):
-                logging.warning(f"Received invalid message format {websocket.client} while idle. Ignoring.")
-                continue
+                    logging.warning(json.dumps({**log_context, "event": "unexpected_idle_binary_data"}))
+
+                    
+            except WebSocketDisconnect:
+                logging.info(json.dumps({**log_context, "event": "client_disconnected_during_idle"}))
+                return # Exit the endpoint
             except Exception as e:
-                logging.error(f"Error in idle loop for {websocket.client}: {e}",exc_info=True)
-                # You might want to close the connection here too.
+                logging.error(json.dumps({**log_context, "event": "error_in_idle_loop", "error": str(e)}), exc_info=True)
                 return
-            
+        
 
         # new gemini session creates here
-        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ACTIVE_GEMINI_SESSIONS.add(session_id)
+        logging.info(json.dumps({**log_context, "event": "gemini_session_initializing", "total_active_gemini_sessions": len(ACTIVE_GEMINI_SESSIONS)}))
 
         # Check if the GCS bucket is configured before proceeding
         if settings.GCS_BUCKET_NAME:
@@ -103,11 +124,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
         try:
             async with client.aio.live.connect(model=MODEL, config=live_config) as session:
-                logging.info(f"Gemini Live multimodal session started successfully with model {MODEL}.")
+                logging.info(json.dumps({**log_context, "event": "gemini_session_started_successfully", "model": MODEL}))
+
                 await websocket.send_json({"type": "call_started"})
 
                 # This task now correctly handles both audio and video frames
-                async def handle_user_input_task():
+                async def handle_user_input_task(log_ctx):
                     try:
                         while True:
                             message = await websocket.receive()
@@ -115,6 +137,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             if "bytes" in message:
                                 data = message["bytes"]
                                 user_wav_writer.writeframes(data)
+                                logging.info(json.dumps({**log_ctx, "event": "audio_chunk_received", "size_bytes": len(data)}))
                                 # Before sending to Gemini, we must encode the raw bytes into a Base64 string.
                                 encoded_audio = base64.b64encode(data).decode('utf-8')
                                 await session.send(input={"data": encoded_audio, "mime_type": "audio/pcm;rate=16000"})
@@ -124,21 +147,21 @@ async def websocket_endpoint(websocket: WebSocket):
                                 msg_type = control_msg.get("type")
 
                                 if msg_type == "video_frame":
-                                    #  This is for VIDEO, which arrives as a Base64 string from BOTH the frontend and Locust
+                                    #  This is for VIDEO, which arrives as a Base64 string 
                                     # We just need to forward the string directly. DO NOT decode it.
                                     img_payload = control_msg["payload"] 
-                                    logging.info("Sending a video frame to Gemini.")
+                                    logging.info(json.dumps({**log_ctx, "event": "video_frame_received", "size_bytes": len(img_payload)}))
                                     # sending live frames 
                                     await session.send(input={"data": img_payload, "mime_type": "image/jpeg"})
 
                                 elif msg_type == "audio_stream_end":
-                                    logging.info("Received audio_stream_end signal. Closing user input task.")
+                                    logging.info(json.dumps({**log_ctx, "event": "audio_stream_end_signal_received"}))
                                     break
                     except WebSocketDisconnect:
-                        logging.info("Client disconnected during call. Closing user input task.")
+                        logging.warning(json.dumps({**log_ctx, "event": "client_disconnected_during_call"}))
 
                         # it correctly handles audio and text responses
-                async def receive_responses_task():
+                async def receive_responses_task(log_ctx):
                     try:
                         while True:
                             full_gemini_transcript = ""
@@ -156,12 +179,12 @@ async def websocket_endpoint(websocket: WebSocket):
                                     full_gemini_transcript += transcript_chunk
                                     await websocket.send_json({"type": "gemini_chunk", "text": transcript_chunk})
                             if full_gemini_transcript:
-                                logging.info("GEMINI said (full): %s", full_gemini_transcript.strip())
+                                logging.info(json.dumps({**log_ctx, "event": "gemini_full_transcript_received", "transcript": full_gemini_transcript.strip()}))
                     except WebSocketDisconnect:
-                        logging.info("Client disconnected during call. Closing receive_responses_task.")
+                        logging.warning(json.dumps({**log_ctx, "event": "client_disconnected_while_receiving_response"}))
 
-                send_task = asyncio.create_task(handle_user_input_task())
-                receive_task = asyncio.create_task(receive_responses_task())
+                send_task = asyncio.create_task(handle_user_input_task(log_context))
+                receive_task = asyncio.create_task(receive_responses_task(log_context))
 
                 done, pending = await asyncio.wait([send_task, receive_task], return_when=asyncio.FIRST_COMPLETED)
                 for task in pending: task.cancel()
@@ -169,43 +192,42 @@ async def websocket_endpoint(websocket: WebSocket):
                     if task.exception(): raise task.exception()
 
         except Exception as e:
-            logging.error("An error occurred during the Gemini session: %s", e, exc_info=True)
+            logging.error(json.dumps({**log_context, "event": "gemini_session_error", "error": str(e)}), exc_info=True)
         finally:
-            logging.info("Closing WAV files for session...")
+            ACTIVE_GEMINI_SESSIONS.discard(session_id)
+            logging.info(json.dumps({**log_context, "event": "gemini_session_ended", "total_active_gemini_sessions": len(ACTIVE_GEMINI_SESSIONS)}))
+            logging.info(json.dumps({**log_context, "event": "file_processing_started"}))
             user_wav_writer.close()
             gemini_wav_writer.close()
 
             # UPLOAD AND CLEANUP LOGIC 
-            if blob_folder: # Only proceed if GCS is configured
-                user_blob_name = f"{blob_folder}user.wav"
-                gemini_blob_name = f"{blob_folder}gemini.wav"
-                
-                # Upload user recording and clean up if successful
-                if upload_to_gcs(user_wav_path, user_blob_name):
+            if blob_folder:
+                if upload_to_gcs(user_wav_path, f"{blob_folder}user.wav"):
                     os.remove(user_wav_path)
-                
-                # Upload gemini recording and clean up if successful
-                if upload_to_gcs(gemini_wav_path, gemini_blob_name):
+                if upload_to_gcs(gemini_wav_path, f"{blob_folder}gemini.wav"):
                     os.remove(gemini_wav_path)
 
-            logging.info("Gemini session ended.")
             try:
                 await websocket.send_json({"type": "call_ended"})
-                logging.info("Sent call_ended signal. Awaiting next 'start_call' signal.")
+                logging.info(json.dumps({**log_context, "event": "call_ended_signal_sent"}))
             except (WebSocketDisconnect, RuntimeError):
-                logging.info("Could not send 'call_ended' because client already disconnected.")
+                logging.warning(json.dumps({**log_context, "event": "client_disconnected_before_call_ended_signal"}))
                 raise WebSocketDisconnect
 
     except WebSocketDisconnect:
-        logging.info("WebSocket connection closed by client.")
+        logging.info(json.dumps({**log_context, "event": "websocket_closed_by_client"}))
     except Exception as e:
-        logging.error("An unhandled error occurred in the websocket endpoint: %s", e, exc_info=True)
+        logging.error(json.dumps({**log_context, "event": "unhandled_endpoint_error", "error": str(e)}), exc_info=True)
     finally:
-        if websocket.client:
-            logging.info("Closing WebSocket connection for: %s", websocket.client)
+        ACTIVE_CONNECTIONS.discard(connection_id)
+        logging.info(json.dumps({
+        **log_context, 
+        "event": "connection_closed",
+        "total_active_connections": len(ACTIVE_CONNECTIONS) # Now we log the NEW total
+    }))
 
 if __name__ == "__main__":
-    logging.info(f"Starting server on {settings.SERVER_HOST}:{settings.SERVER_PORT}")
+    logging.info(json.dumps({"event": "server_starting", "host": settings.SERVER_HOST, "port": settings.SERVER_PORT}))
     uvicorn.run(
         "main:app", 
         host=settings.SERVER_HOST, 

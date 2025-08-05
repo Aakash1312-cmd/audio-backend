@@ -1,5 +1,7 @@
+import logging
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import ValidationError
 
 class Settings(BaseSettings):
     """
